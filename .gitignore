@@ -1,2 +1,6 @@
-.env.local
+# Environment / secrets
 .env
+.env.local
+
+# Generated company lists
+*_companies.txt
