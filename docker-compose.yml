@@ -1,0 +1,32 @@
+services:
+  discover:
+    build: .
+    command: ["python", "discover_companies.py"]
+    env_file: [.env]
+    volumes:
+      - ./data:/data
+    restart: "no"
+
+  ashby:
+    build: .
+    command: ["python", "ashby.py"]
+    env_file: [.env]
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
+
+  greenhouse:
+    build: .
+    command: ["python", "greenhouse.py"]
+    env_file: [.env]
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
+
+  lever:
+    build: .
+    command: ["python", "lever.py"]
+    env_file: [.env]
+    volumes:
+      - ./data:/data
+    restart: unless-stopped

@@ -6,6 +6,7 @@ import re
 import sqlite3
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse, unquote
 
@@ -17,7 +18,18 @@ load_dotenv(".env.local")
 # ----------------------------
 # Config
 # ----------------------------
-COMPANIES_FILE = os.getenv("COMPANIES_FILE", "ashbyhq_companies.txt")
+
+DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
+COMPANIES_DIR = DATA_DIR / "companies"
+WATCH_DIR = DATA_DIR / "watch"
+
+COMPANIES_DIR.mkdir(parents=True, exist_ok=True)
+WATCH_DIR.mkdir(parents=True, exist_ok=True)
+
+COMPANIES_FILE = COMPANIES_DIR / "ashbyhq_companies.txt"
+
+# Use the env var name
+DB_PATH = WATCH_DIR / os.getenv("ASHBY_DB", "ashbyhq_watch.db")
 
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
 JITTER_SECONDS = int(os.getenv("JITTER_SECONDS", "10"))
@@ -33,9 +45,8 @@ COMPANIES_PER_SECOND = float(os.getenv("COMPANIES_PER_SECOND", "3.0"))
 CONCURRENCY = int(os.getenv("CONCURRENCY", "3"))
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_ASHBYHQ", "").strip()
+SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "").strip()
 
-# Use the env var name you asked for
-DB_PATH = os.getenv("ASHBY_DB", "ashbyhq_watch.db")
 
 ASHBY_GQL_ENDPOINT = "https://jobs.ashbyhq.com/api/non-user-graphql?op=ApiJobBoardWithTeams"
 

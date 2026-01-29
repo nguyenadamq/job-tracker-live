@@ -6,6 +6,7 @@ import random
 import re
 import sqlite3
 import time
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional, Tuple, List
 from urllib.parse import urlparse
@@ -26,6 +27,19 @@ CONCURRENCY = int(os.getenv("CONCURRENCY", "20"))
 
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "").strip()
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_LEVER", "").strip()
+
+#Directory 
+DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
+COMPANIES_DIR = DATA_DIR / "companies"
+WATCH_DIR = DATA_DIR / "watch"
+
+COMPANIES_DIR.mkdir(parents=True, exist_ok=True)
+WATCH_DIR.mkdir(parents=True, exist_ok=True)
+
+COMPANIES_FILE = COMPANIES_DIR / "lever_companies.txt"
+
+DB_PATH = WATCH_DIR / os.getenv("GREENHOUSE_DB", "greenhouse_watch.db")
+COMPANIES_FILE = os.getenv("COMPANIES_FILE", "greenhouse_companies.txt")
 
 DB_PATH = os.getenv("LEVER_DB", "lever_watch.db")
 COMPANIES_FILE = os.getenv("COMPANIES_FILE", "lever_companies.txt")

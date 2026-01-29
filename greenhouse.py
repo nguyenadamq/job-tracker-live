@@ -8,6 +8,7 @@ import time
 from dataclasses import dataclass
 from typing import Optional, Tuple, List
 from urllib.parse import urlparse
+from pathlib import Path
 import re
 
 import aiohttp
@@ -24,10 +25,20 @@ JITTER_SECONDS = int(os.getenv("JITTER_SECONDS", "10"))
 TIMEOUT_SECONDS = int(os.getenv("TIMEOUT_SECONDS", "20"))
 CONCURRENCY = int(os.getenv("CONCURRENCY", "20"))
 
-SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "").strip()
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_GREENHOUSE", "").strip()
+SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "").strip()
 
-DB_PATH = os.getenv("DB_PATH", "greenhouse_watch.db")
+#Directory 
+DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
+COMPANIES_DIR = DATA_DIR / "companies"
+WATCH_DIR = DATA_DIR / "watch"
+
+COMPANIES_DIR.mkdir(parents=True, exist_ok=True)
+WATCH_DIR.mkdir(parents=True, exist_ok=True)
+
+COMPANIES_FILE = COMPANIES_DIR / "greenhouse_companies.txt"
+
+DB_PATH = WATCH_DIR / os.getenv("GREENHOUSE_DB", "greenhouse_watch.db")
 COMPANIES_FILE = os.getenv("COMPANIES_FILE", "greenhouse_companies.txt")
 
 
