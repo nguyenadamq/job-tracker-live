@@ -3,12 +3,12 @@ import hashlib
 import json
 import os
 import random
+import re
 import sqlite3
 import time
 from dataclasses import dataclass
 from typing import Optional, Tuple, List
 from urllib.parse import urlparse
-import re
 
 import aiohttp
 from dotenv import load_dotenv
@@ -25,54 +25,63 @@ TIMEOUT_SECONDS = int(os.getenv("TIMEOUT_SECONDS", "20"))
 CONCURRENCY = int(os.getenv("CONCURRENCY", "20"))
 
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "").strip()
-DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_GREENHOUSE", "").strip()
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_LEVER", "").strip()
 
-DB_PATH = os.getenv("DB_PATH", "greenhouse_watch.db")
-COMPANIES_FILE = os.getenv("COMPANIES_FILE", "greenhouse_companies.txt")
-
+DB_PATH = os.getenv("LEVER_DB", "lever_watch.db")
+COMPANIES_FILE = os.getenv("COMPANIES_FILE", "lever_companies.txt")
 
 # ----------------------------
-# Helpers
+# Lever endpoints/helpers
 # ----------------------------
-def job_absolute_url(slug: str, job_id: int) -> str:
-    return f"https://boards.greenhouse.io/{slug}/jobs/{job_id}"
-
-
-def slug_from_board_url(url: str) -> str:
-    parsed = urlparse(url)
-    parts = [p for p in parsed.path.split("/") if p]
-    if not parts:
-        raise ValueError(f"Could not parse company slug from {url}")
-    return parts[0]
-
-
-def greenhouse_jobs_api(slug: str) -> str:
-    return f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs"
-
-
-def normalize_board_url(raw: str) -> str:
+def normalize_lever_company(raw: str) -> str:
+    """
+    Accepts:
+      - company slug (zoox)
+      - https://jobs.lever.co/zoox
+      - jobs.lever.co/zoox
+    Returns:
+      - company slug
+    """
     s = (raw or "").strip()
     if not s:
         raise ValueError("Empty line")
 
-    # If just a slug, make it a URL
-    if "://" not in s and "boards.greenhouse.io" not in s:
-        return f"https://boards.greenhouse.io/{s.strip('/')}"
+    if "://" not in s and "jobs.lever.co" not in s:
+        return s.strip("/")
 
-    # If missing scheme
-    if "://" not in s and "boards.greenhouse.io" in s:
+    if "://" not in s and "jobs.lever.co" in s:
         s = "https://" + s
 
-    return s.rstrip("/")
+    parsed = urlparse(s)
+    parts = [p for p in parsed.path.split("/") if p]
+    if not parts:
+        raise ValueError(f"Could not parse company from {raw}")
+    return parts[0]
 
 
-def load_board_links_from_file(path: str) -> List[str]:
+def lever_postings_api(company: str) -> str:
+    # Unauthenticated public endpoint
+    return f"https://api.lever.co/v0/postings/{company}?mode=json"
+
+
+def job_absolute_url(company: str, host: str, apply_url: Optional[str], posting_id: Optional[str]) -> str:
+    """
+    Prefer applyUrl from API. Fallback to jobs.lever.co/{company}/{id}
+    """
+    if apply_url:
+        return apply_url
+    if posting_id:
+        return f"https://jobs.lever.co/{company}/{posting_id}"
+    return f"https://jobs.lever.co/{company}"
+
+
+def load_companies_from_file(path: str) -> List[str]:
     if not os.path.exists(path):
         raise FileNotFoundError(
-            f"Companies file not found: {path}. Create it with one board URL per line."
+            f"Companies file not found: {path}. Create it with one company slug or jobs.lever.co URL per line."
         )
 
-    links: List[str] = []
+    companies: List[str] = []
     with open(path, "r", encoding="utf-8") as f:
         for line_no, line in enumerate(f, start=1):
             raw = line.strip()
@@ -83,44 +92,48 @@ def load_board_links_from_file(path: str) -> List[str]:
                 continue
 
             try:
-                url = normalize_board_url(raw)
-                slug = slug_from_board_url(url)
-                links.append(f"https://boards.greenhouse.io/{slug}")
+                company = normalize_lever_company(raw)
+                companies.append(company)
             except Exception as e:
                 print(f"[warn] Skipping invalid line {line_no} in {path}: {line!r} ({e})")
 
-    # Dedupe preserve order
     seen = set()
     out: List[str] = []
-    for u in links:
-        if u not in seen:
-            seen.add(u)
-            out.append(u)
+    for c in companies:
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
     return out
 
 
-def stable_fingerprint(jobs_json: dict) -> str:
-    jobs = jobs_json.get("jobs", [])
-    compact = [{"id": j.get("id"), "updated_at": j.get("updated_at")} for j in jobs]
+def stable_fingerprint(postings_json: list) -> str:
+    # Store stable subset, similar to your Greenhouse approach
+    compact = [{"id": p.get("id"), "updatedAt": p.get("updatedAt")} for p in (postings_json or [])]
     blob = json.dumps(compact, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(blob).hexdigest()
 
 
-def format_new_jobs_message(slug: str, new_jobs: list, limit: int = 15) -> str:
-    board_url = f"https://boards.greenhouse.io/{slug}"
+def format_new_jobs_message(company: str, new_jobs: list, limit: int = 15) -> str:
+    board_url = f"https://jobs.lever.co/{company}"
     lines = [f"Board: {board_url}"]
 
-    for j in sorted(new_jobs, key=lambda x: x.get("id") or 0)[:limit]:
-        jid = j.get("id")
-        title = (j.get("title") or "").strip()
-        if jid and title:
-            lines.append(f"{title} | {job_absolute_url(slug, jid)}")
+    def sort_key(p: dict):
+        # updatedAt is ms since epoch; id is string
+        return (p.get("updatedAt") or 0, p.get("id") or "")
+
+    for p in sorted(new_jobs, key=sort_key)[:limit]:
+        title = (p.get("text") or "").strip()
+        apply_url = p.get("applyUrl")
+        pid = p.get("id")
+        url = job_absolute_url(company, board_url, apply_url, pid)
+        if title and url:
+            lines.append(f"{title} | {url}")
 
     return "\n".join(lines)
 
 
 # ----------------------------
-# Title matching
+# Title matching (same as your Greenhouse program)
 # ----------------------------
 KEYWORDS = ("software engineer", "software developer", "ai engineer", "full stack", "frontend engineer")
 
@@ -175,13 +188,14 @@ def title_matches(title: str) -> bool:
     raw = (title or "").lower()
     if any(re.search(p, raw) for p in EXCLUDE_TITLE_PATTERNS):
         return False
-
     t = normalize_title(title)
     return any(k in t for k in KEYWORDS)
 
 
 # ----------------------------
-# US location matching
+# US location matching (same as your Greenhouse program)
+# Lever postings may have 'categories' and 'workplaceType'/'location'
+# We'll try multiple fields.
 # ----------------------------
 US_STATES = {
     "alabama","alaska","arizona","arkansas","california","colorado","connecticut","delaware",
@@ -214,23 +228,35 @@ REMOTE_US_PATTERNS = [
 ]
 
 
-def extract_location_texts(job: dict) -> List[str]:
+def extract_location_texts(posting: dict) -> List[str]:
     texts: List[str] = []
 
-    loc = job.get("location")
-    if isinstance(loc, dict):
-        name = loc.get("name")
+    # Lever field examples:
+    # posting["categories"]["location"]
+    cats = posting.get("categories")
+    if isinstance(cats, dict):
+        loc = cats.get("location")
+        if loc:
+            texts.append(str(loc))
+
+    # Some boards also include a top-level "location" object or "workplaceType"
+    loc_obj = posting.get("location")
+    if isinstance(loc_obj, dict):
+        name = loc_obj.get("name")
         if name:
             texts.append(str(name))
+    elif isinstance(loc_obj, str):
+        texts.append(loc_obj)
 
-    for key in ("locations", "additional_locations"):
-        arr = job.get(key)
-        if isinstance(arr, list):
-            for item in arr:
-                if isinstance(item, dict) and item.get("name"):
-                    texts.append(str(item["name"]))
-                elif isinstance(item, str):
-                    texts.append(item)
+    wt = posting.get("workplaceType")
+    if wt:
+        texts.append(str(wt))
+
+    # Fallback: sometimes team/department strings include regions
+    for k in ("team", "department"):
+        v = posting.get(k)
+        if v:
+            texts.append(str(v))
 
     return [t.strip() for t in texts if t and str(t).strip()]
 
@@ -248,7 +274,6 @@ def is_us_location_text(text: str) -> bool:
         if re.search(rf"\b{re.escape(state)}\b", t):
             return True
 
-    # Abbr check: require word boundaries, avoid matching inside other words
     for abbr in US_STATE_ABBR:
         if re.search(rf"(?<![a-z]){abbr}(?![a-z])", t):
             return True
@@ -256,8 +281,8 @@ def is_us_location_text(text: str) -> bool:
     return False
 
 
-def job_is_us(job: dict) -> bool:
-    return any(is_us_location_text(t) for t in extract_location_texts(job))
+def posting_is_us(posting: dict) -> bool:
+    return any(is_us_location_text(t) for t in extract_location_texts(posting))
 
 
 # ----------------------------
@@ -277,7 +302,7 @@ def init_db() -> sqlite3.Connection:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS company_state (
-            slug TEXT PRIMARY KEY,
+            company TEXT PRIMARY KEY,
             etag TEXT,
             last_modified TEXT,
             fingerprint TEXT,
@@ -286,27 +311,14 @@ def init_db() -> sqlite3.Connection:
         )
         """
     )
-
-    desired = {
-        "etag": "TEXT",
-        "last_modified": "TEXT",
-        "fingerprint": "TEXT",
-        "last_seen_ts": "INTEGER",
-        "notified_job_ids_json": "TEXT",
-    }
-    cols = {r[1] for r in conn.execute("PRAGMA table_info(company_state)").fetchall()}
-    for col, col_type in desired.items():
-        if col not in cols:
-            conn.execute(f"ALTER TABLE company_state ADD COLUMN {col} {col_type}")
-
     conn.commit()
     return conn
 
 
-def load_state(conn: sqlite3.Connection, slug: str) -> StoredState:
+def load_state(conn: sqlite3.Connection, company: str) -> StoredState:
     row = conn.execute(
-        "SELECT etag, last_modified, fingerprint, last_seen_ts, notified_job_ids_json FROM company_state WHERE slug = ?",
-        (slug,),
+        "SELECT etag, last_modified, fingerprint, last_seen_ts, notified_job_ids_json FROM company_state WHERE company = ?",
+        (company,),
     ).fetchone()
     if not row:
         return StoredState(None, None, None, None, None)
@@ -315,7 +327,7 @@ def load_state(conn: sqlite3.Connection, slug: str) -> StoredState:
 
 def save_state(
     conn: sqlite3.Connection,
-    slug: str,
+    company: str,
     etag: Optional[str],
     last_modified: Optional[str],
     fingerprint: Optional[str],
@@ -324,16 +336,16 @@ def save_state(
 ) -> None:
     conn.execute(
         """
-        INSERT INTO company_state (slug, etag, last_modified, fingerprint, last_seen_ts, notified_job_ids_json)
+        INSERT INTO company_state (company, etag, last_modified, fingerprint, last_seen_ts, notified_job_ids_json)
         VALUES (?, ?, ?, ?, ?, ?)
-        ON CONFLICT(slug) DO UPDATE SET
+        ON CONFLICT(company) DO UPDATE SET
             etag=excluded.etag,
             last_modified=excluded.last_modified,
             fingerprint=excluded.fingerprint,
             last_seen_ts=excluded.last_seen_ts,
             notified_job_ids_json=excluded.notified_job_ids_json
         """,
-        (slug, etag, last_modified, fingerprint, last_seen_ts, notified_job_ids_json),
+        (company, etag, last_modified, fingerprint, last_seen_ts, notified_job_ids_json),
     )
     conn.commit()
 
@@ -345,7 +357,6 @@ async def post_webhook(session: aiohttp.ClientSession, url: str, text: str) -> N
     if not url:
         return
     try:
-        # Discord supports {"content": "..."}
         await session.post(url, json={"content": text}, timeout=TIMEOUT_SECONDS)
     except Exception as e:
         print(f"[warn] webhook post failed: {e}")
@@ -357,7 +368,6 @@ async def post_discord_long(session: aiohttp.ClientSession, text: str, max_len: 
 
     lines = text.split("\n")
     chunk = ""
-
     for line in lines:
         if len(chunk) + len(line) + 1 > max_len:
             await post_webhook(session, DISCORD_WEBHOOK_URL, chunk)
@@ -372,7 +382,6 @@ async def post_discord_long(session: aiohttp.ClientSession, text: str, max_len: 
 async def notify(session: aiohttp.ClientSession, message: str) -> None:
     print(message)
 
-    # Slack expects {"text": "..."}
     if SLACK_WEBHOOK_URL:
         try:
             await session.post(SLACK_WEBHOOK_URL, json={"text": message}, timeout=TIMEOUT_SECONDS)
@@ -387,10 +396,12 @@ async def notify(session: aiohttp.ClientSession, message: str) -> None:
 # Polling
 # ----------------------------
 async def fetch_company(
-    session: aiohttp.ClientSession, conn: sqlite3.Connection, slug: str
+    session: aiohttp.ClientSession,
+    conn: sqlite3.Connection,
+    company: str,
 ) -> Tuple[str, str]:
-    api_url = greenhouse_jobs_api(slug)
-    prior = load_state(conn, slug)
+    api_url = lever_postings_api(company)
+    prior = load_state(conn, company)
 
     try:
         notified_ids = set(json.loads(prior.notified_job_ids_json)) if prior.notified_job_ids_json else set()
@@ -408,44 +419,45 @@ async def fetch_company(
     try:
         async with session.get(api_url, headers=headers, timeout=TIMEOUT_SECONDS) as resp:
             if resp.status == 304:
-                save_state(conn, slug, prior.etag, prior.last_modified, prior.fingerprint, now_ts, prior.notified_job_ids_json)
-                return slug, "unchanged (304)"
+                save_state(conn, company, prior.etag, prior.last_modified, prior.fingerprint, now_ts, prior.notified_job_ids_json)
+                return company, "unchanged (304)"
 
             if resp.status != 200:
-                save_state(conn, slug, prior.etag, prior.last_modified, prior.fingerprint, now_ts, prior.notified_job_ids_json)
-                return slug, f"error HTTP {resp.status}"
+                save_state(conn, company, prior.etag, prior.last_modified, prior.fingerprint, now_ts, prior.notified_job_ids_json)
+                return company, f"error HTTP {resp.status}"
 
             etag = resp.headers.get("ETag")
             last_modified = resp.headers.get("Last-Modified")
 
-            data = await resp.json(content_type=None)
-            fp = stable_fingerprint(data)
+            postings = await resp.json(content_type=None)
+            if not isinstance(postings, list):
+                postings = []
 
-            jobs = data.get("jobs", [])
-            by_id = {j.get("id"): j for j in jobs if j.get("id")}
+            fp = stable_fingerprint(postings)
 
+            by_id = {p.get("id"): p for p in postings if p.get("id")}
             current_ids = set(by_id.keys())
-            new_ids = [jid for jid in current_ids if jid not in notified_ids]
+            new_ids = [pid for pid in current_ids if pid not in notified_ids]
 
             new_matching: List[dict] = []
-            for jid in new_ids:
-                j = by_id.get(jid)
-                if not j:
+            for pid in new_ids:
+                p = by_id.get(pid)
+                if not p:
                     continue
-                if title_matches(j.get("title", "")) and job_is_us(j):
-                    new_matching.append(j)
+                title = (p.get("text") or "").strip()
+                if title_matches(title) and posting_is_us(p):
+                    new_matching.append(p)
 
-            # Only send anything if there is a new match
             if new_matching:
-                for j in new_matching:
-                    notified_ids.add(j["id"])
+                for p in new_matching:
+                    notified_ids.add(p["id"])
 
-                msg = format_new_jobs_message(slug, new_matching, limit=15)
+                msg = format_new_jobs_message(company, new_matching, limit=15)
                 await notify(session, msg)
 
             save_state(
                 conn,
-                slug,
+                company,
                 etag,
                 last_modified,
                 fp,
@@ -453,24 +465,22 @@ async def fetch_company(
                 json.dumps(sorted(list(notified_ids))),
             )
 
-            return slug, "new match" if new_matching else "ok"
+            return company, "new match" if new_matching else "ok"
 
     except asyncio.TimeoutError:
-        save_state(conn, slug, prior.etag, prior.last_modified, prior.fingerprint, now_ts, prior.notified_job_ids_json)
-        return slug, "timeout"
+        save_state(conn, company, prior.etag, prior.last_modified, prior.fingerprint, now_ts, prior.notified_job_ids_json)
+        return company, "timeout"
     except Exception as e:
-        save_state(conn, slug, prior.etag, prior.last_modified, prior.fingerprint, now_ts, prior.notified_job_ids_json)
-        return slug, f"exception: {e}"
+        save_state(conn, company, prior.etag, prior.last_modified, prior.fingerprint, now_ts, prior.notified_job_ids_json)
+        return company, f"exception: {e}"
 
 
-async def run_forever():
-    board_links = load_board_links_from_file(COMPANIES_FILE)
-    slugs = sorted({slug_from_board_url(u) for u in board_links})
+async def run_forever() -> None:
+    companies = load_companies_from_file(COMPANIES_FILE)
+    if not companies:
+        raise RuntimeError(f"No valid companies found in {COMPANIES_FILE}. Add one per line.")
 
-    if not slugs:
-        raise RuntimeError(f"No valid company boards found in {COMPANIES_FILE}. Add one per line.")
-
-    print(f"Watching {len(slugs)} company boards (from {COMPANIES_FILE})")
+    print(f"Watching {len(companies)} Lever boards (from {COMPANIES_FILE})")
 
     conn = init_db()
     timeout = aiohttp.ClientTimeout(total=TIMEOUT_SECONDS)
@@ -479,13 +489,13 @@ async def run_forever():
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         sem = asyncio.Semaphore(CONCURRENCY)
 
-        async def bounded_fetch(s: str):
+        async def bounded_fetch(c: str):
             async with sem:
-                return await fetch_company(session, conn, s)
+                return await fetch_company(session, conn, c)
 
         while True:
             start = time.time()
-            tasks = [asyncio.create_task(bounded_fetch(slug)) for slug in slugs]
+            tasks = [asyncio.create_task(bounded_fetch(company)) for company in companies]
             results = await asyncio.gather(*tasks)
 
             counts = {}
